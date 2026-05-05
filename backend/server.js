@@ -7,6 +7,8 @@ import mongoose from "mongoose";
 import YahooFinance from "yahoo-finance2";
 import authRoutes from "./routes/auth.js";
 import portfolioRoutes from "./routes/portfolio.js";
+import fetch from "node-fetch";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
@@ -17,10 +19,8 @@ const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/
 const yahooFinance = new YahooFinance({ suppressNotices: ["yahooSurvey"] });
 
 app.use(cors({
-  origin: (origin, cb) =>
-    (!origin || /^http:\/\/localhost(:\d+)?$/.test(origin))
-      ? cb(null, true)
-      : cb(new Error("CORS: origin not allowed")),
+  origin: true,
+  credentials: true
 }));
 app.use(express.json());
 
@@ -277,49 +277,188 @@ app.get("/api/heatmap", async (req, res) => {
 });
 
 // ── /api/advisor — Gemini market analysis ─────────────────────
+
 app.post("/api/advisor", async (req, res) => {
   try {
-    const { question, context } = req.body;
+    const { question, context, rsi, macdLine, macdSignal, sma50, sma200 } = req.body;
 
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(501).json({ error: "Gemini API not configured" });
-    }
+    let advice = "";
 
-    const prompt = `You are a financial advisor for the Indian stock market. User question: "${question}". ${context ? `Context: ${context}` : ""}
-    
-Explain in simple words suitable for beginners. Focus on risk awareness and market fundamentals.`;
+    // ─────────────────────────────
+    // 🧠 STEP 1: TRY GEMINI (AI)
+    // ─────────────────────────────
+    try {
+      if (process.env.GEMINI_API_KEY) {
+        const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-        }),
+        const model = genAI.getGenerativeModel({
+          model: "gemini-2.0-flash-001", // keep your working model
+        });
+
+        const prompt = `
+You are a financial advisor for Indian stock market.
+
+User question: "${question || "Analyze this stock"}"
+${context ? `Context: ${context}` : ""}
+
+Also consider:
+RSI: ${rsi}
+MACD: ${macdLine} vs ${macdSignal}
+SMA50: ${sma50}, SMA200: ${sma200}
+
+Explain simply, include risk, and give actionable advice.
+`;
+
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        const text = response.text();
+
+        if (text) {
+          advice = text;
+          return res.json({ advice, source: "AI" });
+        }
       }
-    );
-
-    if (!response.ok) {
-      throw new Error(`Gemini API HTTP ${response.status}`);
+    } catch (err) {
+      console.log("⚠️ Gemini failed, switching to fallback...");
     }
 
-    const data = await response.json();
-    const advice = data.candidates?.[0]?.content?.parts?.[0]?.text || "No response";
+    // ─────────────────────────────
+    // 🧠 STEP 2: FALLBACK LOGIC (NO API)
+    // ─────────────────────────────
 
-    res.json({ advice });
+    let signals = [];
+    let score = 0;
+
+    // RSI
+    if (rsi > 70) {
+      signals.push("Overbought (RSI high)");
+      score -= 1;
+    } else if (rsi < 30) {
+      signals.push("Oversold (Buying opportunity)");
+      score += 1;
+    } else {
+      signals.push("RSI Neutral");
+    }
+
+    // MACD
+    if (macdLine > macdSignal) {
+      signals.push("Bullish Momentum (MACD)");
+      score += 1;
+    } else {
+      signals.push("Bearish Momentum (MACD)");
+      score -= 1;
+    }
+
+    // SMA Trend
+    if (sma50 > sma200) {
+      signals.push("Uptrend (Golden Cross)");
+      score += 1;
+    } else {
+      signals.push("Downtrend (Death Cross)");
+      score -= 1;
+    }
+
+    // Final Decision
+    let finalCall = "HOLD";
+    if (score >= 2) finalCall = "BUY";
+    else if (score <= -2) finalCall = "SELL";
+
+    advice = `
+📊 Technical Analysis Summary:
+
+- ${signals.join("\n- ")}
+
+📌 Final Suggestion: ${finalCall}
+
+⚠️ This is based on technical indicators only. Always consider fundamentals, news, and risk before investing.
+`;
+
+    return res.json({ advice, source: "fallback" });
+
   } catch (err) {
-    console.error("Advisor error:", err.message);
-    res.status(500).json({ error: "Failed to get advice" });
+    console.error("❌ Advisor crashed:", err);
+    res.status(500).json({ error: "Advisor failed completely" });
   }
 });
 
-// ── Health check ──────────────────────────────────────────────
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", db: mongoose.connection.readyState === 1 ? "connected" : "disconnected" });
+
+app.get("/api/analyze", async (req, res) => {
+  try {
+    const { symbol } = req.query;
+
+    if (!symbol) {
+      return res.status(400).json({ error: "Symbol required" });
+    }
+
+    // 1. Get quote
+    const quote = await fetchQuotes([symbol]);
+
+    // 2. Get technicals
+    const technicalsRes = await fetch(
+      `http://localhost:${PORT}/api/technicals?symbol=${symbol}`
+    );
+    const technicals = await technicalsRes.json();
+
+    // 3. Get candles
+    const candlesRes = await fetch(
+      `http://localhost:${PORT}/api/candles?symbol=${symbol}`
+    );
+    const candles = await candlesRes.json();
+
+    const tech = technicals;
+
+const rsi = tech?.rsi || 50;
+const macd = tech?.macd || 0;
+const sma50 = tech?.sma50 || 0;
+const sma200 = tech?.sma200 || 0;
+
+// Simple signal logic
+let signal = "HOLD";
+let confidence = 50;
+
+if (rsi < 30 && macd > 0 && sma50 > sma200) {
+  signal = "BUY";
+  confidence = 75;
+} else if (rsi > 70 && macd < 0 && sma50 < sma200) {
+  signal = "SELL";
+  confidence = 75;
+}
+
+// FINAL RESPONSE (MATCHES FRONTEND)
+res.json({
+  ticker: symbol,
+
+  signal,
+  confidence,
+
+  indicators: {
+    rsi,
+    macd,
+    sma50,
+    sma200
+  },
+
+  charts: {
+    price: candles || [],
+    rsi: candles?.map(c => ({
+      time: c.time,
+      value: rsi
+    })) || []
+  },
+
+  raw: {
+    quote: quote[0],
+    technicals,
+    candles
+  }
 });
 
-// ── Start server ──────────────────────────────────────────────
+  } catch (err) {
+    console.error("Analyze error:", err);
+    res.status(500).json({ error: "Analyze failed" });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✓ Quantyx backend running on port ${PORT}`);
 });

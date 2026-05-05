@@ -13,7 +13,7 @@ import {
 import { createChart, LineSeries } from "lightweight-charts";
 import { NSE_STOCKS } from "@/lib/nseStocks";
 
-const API = "http://localhost:3001/api/analyse";
+const API = "http://localhost:3001/api/analyze";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -103,11 +103,31 @@ function LWChart({ data, type = "line", color, label, height = 180, refLine }) {
       lineWidth: 2,
       priceFormat: { type: "price", precision: 2, minMove: 0.01 },
     });
-    const parsedData = data.map(d => ({
-      time: typeof d.time === 'string' && d.time.includes('T') ? d.time.split('T')[0] : d.time,
-      value: d.value
-    }));
-    series.setData(parsedData);
+    const parsedData = (data || [])
+      .map(d => {
+        if (!d || !d.time) return null;
+
+        const date = new Date(d.time);
+
+        // ❌ remove invalid dates
+        if (isNaN(date.getTime())) return null;
+
+        return {
+          time: date.toISOString().split("T")[0], // ✅ required format
+          value: typeof d.value === "number" ? d.value : 0
+        };
+      })
+      .filter(Boolean) // remove nulls
+      .sort((a, b) => new Date(a.time) - new Date(b.time)) // ✅ sort ascending
+      .filter((item, index, arr) =>
+        index === 0 || item.time !== arr[index - 1].time // ✅ remove duplicates
+      );
+
+    // ✅ prevent crash if empty
+    if (parsedData.length > 0) {
+      series.setData(parsedData);
+    }
+    
 
     if (refLine !== undefined) {
       const ref = chart.addSeries(LineSeries, {
@@ -185,16 +205,35 @@ function PriceChart({ charts }) {
 
     // Price line
     const priceSeries = chart.addSeries(LineSeries, { color: mint, lineWidth: 2 });
-    priceSeries.setData(charts.price.map(d => ({ 
-      time: typeof d.time === 'string' && d.time.includes('T') ? d.time.split('T')[0] : d.time, 
-      value: d.close 
-    })));
+    const formattedData = (charts?.price || [])
+  .map(d => {
+    if (!d || !d.time) return null;
+
+    const date = new Date(d.time);
+    if (isNaN(date.getTime())) return null;
+
+    return {
+      time: date.toISOString().split("T")[0],
+      value: typeof d.value === "number" ? d.value : 0
+    };
+  })
+  .filter(Boolean)
+  .sort((a, b) => new Date(a.time) - new Date(b.time))
+  .filter((item, index, arr) =>
+    index === 0 || item.time !== arr[index - 1].time
+  );
+
+if (formattedData.length > 0) {
+  priceSeries.setData(formattedData); // ✅ FIXED
+}
 
     // SMA 20
     if (charts.sma20?.length) {
       const s20 = chart.addSeries(LineSeries, { color: purple, lineWidth: 1, lineStyle: 2 });
       s20.setData(charts.sma20.map(d => ({
-        time: typeof d.time === 'string' && d.time.includes('T') ? d.time.split('T')[0] : d.time,
+        time: d.time
+  ? new Date(d.time).toISOString().split("T")[0]
+  : "2024-01-01",
         value: d.value
       })));
     }
@@ -203,7 +242,9 @@ function PriceChart({ charts }) {
     if (charts.sma50?.length) {
       const s50 = chart.addSeries(LineSeries, { color: yellow, lineWidth: 1, lineStyle: 2 });
       s50.setData(charts.sma50.map(d => ({
-        time: typeof d.time === 'string' && d.time.includes('T') ? d.time.split('T')[0] : d.time,
+        time: d.time
+  ? new Date(d.time).toISOString().split("T")[0]
+  : "2024-01-01",
         value: d.value
       })));
     }
@@ -369,7 +410,7 @@ export default function Analyse() {
     setShowSug(false);
 
     try {
-      const res  = await fetch(`${API}/${clean}`);
+      const res = await fetch(`${API}?symbol=${clean}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Prediction failed");
       setResult(data);
@@ -385,7 +426,7 @@ export default function Analyse() {
     if (e.key === "Escape") setShowSug(false);
   }
 
-  const isBuy  = result?.direction === "UP";
+  const isBuy = result?.signal === "BUY";
   const isUp   = (v) => v >= 0;
 
   return (
@@ -550,7 +591,7 @@ export default function Analyse() {
                 <IndicatorPill label="RSI 14" value={result.indicators.rsi}
                   sub={result.indicators.rsi > 70 ? "Overbought" : result.indicators.rsi < 30 ? "Oversold" : "Neutral"} />
                 <IndicatorPill label="MACD" value={result.indicators.macd}
-                  sub={result.indicators.macdHist >= 0 ? "Bullish" : "Bearish"} />
+                  sub={(result.indicators?.macdHist ?? 0) >= 0 ? "Bullish" : "Bearish"} />
                 <IndicatorPill label="SMA 20" value={`₹${result.indicators.sma20}`} />
                 <IndicatorPill label="SMA 50" value={`₹${result.indicators.sma50}`} />
                 <IndicatorPill label="Volatility" value={(result.indicators.volatility * 100).toFixed(2) + "%"}
@@ -594,7 +635,7 @@ export default function Analyse() {
                   <RefreshCw className="w-4 h-4 text-primary" />
                   <h2 className="text-sm font-mono font-bold">Walk-Forward Validation</h2>
                 </div>
-                <WalkForwardTable walkForward={result.walkForward} />
+                {result.walkForward && <WalkForwardTable walkForward={result.walkForward} />}
               </div>
 
               <div className="glass rounded-2xl p-5">
@@ -602,7 +643,7 @@ export default function Analyse() {
                   <Brain className="w-4 h-4 text-primary" />
                   <h2 className="text-sm font-mono font-bold">Feature Importance</h2>
                 </div>
-                <FeatureImportance data={result.featureImportance} />
+                {result.featureImportance && <FeatureImportance data={result.featureImportance} />}
               </div>
             </div>
 
@@ -612,7 +653,7 @@ export default function Analyse() {
                 <Newspaper className="w-4 h-4 text-primary" />
                 <h2 className="text-sm font-mono font-bold">News Sentiment</h2>
               </div>
-              <NewsPanel sentiment={result.sentiment} />
+              {result.sentiment && <NewsPanel sentiment={result.sentiment} />}
             </div>
 
             {/* Disclaimer */}

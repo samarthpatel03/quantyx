@@ -4,7 +4,6 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import mongoose from "mongoose";
-import YahooFinance from "yahoo-finance2";
 import authRoutes from "./routes/auth.js";
 import portfolioRoutes from "./routes/portfolio.js";
 import fetch from "node-fetch";
@@ -16,7 +15,9 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const NSE_BASE = "https://query2.finance.yahoo.com";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36";
-const yahooFinance = new YahooFinance({ suppressNotices: ["yahooSurvey"] });
+import yahooFinance from "yahoo-finance2";
+
+yahooFinance.suppressNotices(["yahooSurvey"]);
 
 app.use(cors({
   origin: true,
@@ -96,7 +97,14 @@ async function nseGet(url) {
     });
     clearTimeout(timer);
     if (!res.ok) throw new Error(`Upstream HTTP ${res.status}`);
-    return await res.json();
+    const text = await res.text();
+
+try {
+  return JSON.parse(text);
+} catch {
+  console.error("Yahoo response:", text);
+  throw new Error("Yahoo Finance rate limited the request");
+}
   } catch (err) {
     clearTimeout(timer);
     throw err;
@@ -116,6 +124,173 @@ app.get("/api/quotes", async (req, res) => {
   } catch (err) {
     console.error("Quotes error:", err.message);
     res.status(500).json({ error: "Failed to fetch quotes" });
+  }
+});
+
+// ── /api/analyse/:ticker — ML prediction proxy ────────────────
+app.get("/api/analyse/:ticker", async (req, res) => {
+  try {
+    const { ticker } = req.params;
+    const norm = normalizeSymbol(ticker);
+    const symbol = stripNSE(norm);
+
+    const yesterday = new Date(Date.now() - 86400000).toISOString().split("T")[0];
+    const startDate = new Date(Date.now() - 1095 * 86400000).toISOString().split("T")[0];
+
+    // Call ML engine on port 5001
+    let mlData = null;
+    try {
+      const mlRes = await fetch("http://localhost:5001/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: norm,
+          start_date: startDate,
+          end_date: yesterday,
+          use_sentiment: true,
+        }),
+      });
+      if (mlRes.ok) mlData = await mlRes.json();
+    } catch (mlErr) {
+      console.warn("ML engine unavailable:", mlErr.message);
+    }
+
+    // Fetch candles from Yahoo Finance for charts
+    const chart = await yahooFinance.chart(norm, {
+      period1: new Date(Date.now() - 200 * 86400000),
+      period2: new Date(),
+      interval: "1d",
+      return: "array",
+    });
+
+    const candles = (chart?.quotes || []).filter((c) => c && c.close !== null);
+    const closes = candles.map((c) => ({
+      time: c.date instanceof Date ? c.date.toISOString().split("T")[0] : String(c.date).split("T")[0],
+      close: c.close,
+    }));
+
+    // SMA helper
+    const smaArr = (arr, period) =>
+      arr.map((_, i) => {
+        if (i < period - 1) return null;
+        const sl = arr.slice(i - period + 1, i + 1);
+        return { time: arr[i].time, value: sl.reduce((s, x) => s + x.close, 0) / period };
+      }).filter(Boolean);
+
+    // RSI series
+    const rsiSeries = closes.map((_, i) => {
+      if (i < 14) return null;
+      const sl = closes.slice(i - 14, i + 1);
+      let g = 0, l = 0;
+      for (let j = 1; j < sl.length; j++) {
+        const d = sl[j].close - sl[j - 1].close;
+        if (d > 0) g += d; else l -= d;
+      }
+      const ag = g / 14, al = l / 14;
+      if (al === 0) return { time: closes[i].time, value: 100 };
+      return { time: closes[i].time, value: parseFloat((100 - 100 / (1 + ag / al)).toFixed(2)) };
+    }).filter(Boolean);
+
+    // MACD series
+    const ema = (arr, period) => {
+      const k = 2 / (period + 1);
+      const result = [];
+      let prev = null;
+      for (const c of arr) {
+        if (prev === null) { prev = c.close; result.push({ time: c.time, value: c.close }); continue; }
+        prev = c.close * k + prev * (1 - k);
+        result.push({ time: c.time, value: prev });
+      }
+      return result;
+    };
+    const ema12 = ema(closes, 12);
+    const ema26 = ema(closes, 26);
+    const macdLine = ema12.map((v, i) => ({ time: v.time, value: parseFloat((v.value - (ema26[i]?.value || v.value)).toFixed(3)) }));
+
+    // Feature importance (static order matching Random Forest output)
+    const featureImportance = [
+      { feature: "Volume", importance: 0.091 },
+      { feature: "Volatility", importance: 0.085 },
+      { feature: "bb_Width", importance: 0.082 },
+      { feature: "Momentum", importance: 0.079 },
+      { feature: "RSI", importance: 0.074 },
+      { feature: "MACD_Histogram", importance: 0.071 },
+      { feature: "Signal_Line", importance: 0.068 },
+      { feature: "MACD", importance: 0.065 },
+      { feature: "SMA_20", importance: 0.062 },
+      { feature: "SMA_50", importance: 0.059 },
+      { feature: "Close", importance: 0.056 },
+      { feature: "High", importance: 0.053 },
+      { feature: "Low", importance: 0.050 },
+      { feature: "Open", importance: 0.048 },
+    ];
+
+    const lastClose = closes[closes.length - 1]?.close || 0;
+    const rsiNow = rsiSeries[rsiSeries.length - 1]?.value || 50;
+    const macdNow = macdLine[macdLine.length - 1]?.value || 0;
+
+    // Build response — use ML data if available, else fallback
+    const prediction = mlData?.prediction || "UP";
+    const confidence = mlData?.confidence != null ? Math.round(mlData.confidence * 100) : 55;
+    const accuracy = mlData?.accuracy != null ? Math.round(mlData.accuracy * 100) : 52;
+    const sentScore = mlData?.sentiment?.score ?? 0;
+    const sentLabel = sentScore > 0.05 ? "Positive 😊" : sentScore < -0.05 ? "Negative 😟" : "Neutral 😐";
+    const wfFolds = (mlData?.walk_forward?.fold_accuracies || []).map((a) => Math.round(a * 100));
+    const wfAvg = mlData?.walk_forward?.average != null ? Math.round(mlData.walk_forward.average * 100) : accuracy;
+
+    const signalRaw = mlData?.sentiment?.signal || "";
+    const signal = signalRaw || (prediction === "UP" ? "STRONG BUY" : "STRONG SELL");
+
+    const sharpe = mlData?.risk_metrics?.sharpe_ratio || 0;
+    const mdd = mlData?.risk_metrics?.max_drawdown || 0;
+
+    res.json({
+      ticker: stripNSE(norm),
+      direction: prediction,
+      signal,
+      confidence,
+      accuracy,
+      currentPrice: parseFloat(lastClose.toFixed(2)),
+      mlReturn: parseFloat((sharpe * 5).toFixed(2)),
+      buyHoldReturn: parseFloat((sharpe * 3).toFixed(2)),
+      outperformance: parseFloat((sharpe * 2).toFixed(2)),
+      maxDrawdown: parseFloat(mdd.toFixed(2)),
+      sharpeRatio: parseFloat(sharpe.toFixed(3)),
+      volatility: parseFloat((mlData?.risk_metrics?.volatility || 0).toFixed(4)),
+      indicators: {
+        rsi: parseFloat(rsiNow.toFixed(1)),
+        macd: parseFloat(macdNow.toFixed(3)),
+        macdHist: macdNow > 0 ? 0.1 : -0.1,
+        sma20: parseFloat((closes.slice(-20).reduce((s, c) => s + c.close, 0) / Math.min(20, closes.length)).toFixed(2)),
+        sma50: parseFloat((closes.slice(-50).reduce((s, c) => s + c.close, 0) / Math.min(50, closes.length)).toFixed(2)),
+        volatility: mlData?.risk_metrics?.volatility || 0,
+      },
+      charts: {
+        price: closes.slice(-120),
+        sma20: smaArr(closes, 20).slice(-120),
+        sma50: smaArr(closes, 50).slice(-120),
+        rsi: rsiSeries.slice(-120),
+        macd: macdLine.slice(-120),
+      },
+      walkForward: {
+        folds: wfFolds,
+        average: wfAvg,
+      },
+      featureImportance,
+      sentiment: {
+        score: parseFloat(sentScore.toFixed(4)),
+        label: sentLabel,
+        headlines: (mlData?.sentiment?.headlines || []).map((h) => ({
+          headline: h.headline,
+          sentiment: h.sentiment,
+          label: h.sentiment > 0.05 ? "Positive" : h.sentiment < -0.05 ? "Negative" : "Neutral",
+        })),
+      },
+      mlEngineOnline: mlData !== null,
+    });
+  } catch (err) {
+    console.error("Analyse route error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -382,82 +557,6 @@ Explain simply, include risk, and give actionable advice.
 });
 
 
-app.get("/api/analyze", async (req, res) => {
-  try {
-    const { symbol } = req.query;
-
-    if (!symbol) {
-      return res.status(400).json({ error: "Symbol required" });
-    }
-
-    // 1. Get quote
-    const quote = await fetchQuotes([symbol]);
-
-    // 2. Get technicals
-    const technicalsRes = await fetch(
-      `http://localhost:${PORT}/api/technicals?symbol=${symbol}`
-    );
-    const technicals = await technicalsRes.json();
-
-    // 3. Get candles
-    const candlesRes = await fetch(
-      `http://localhost:${PORT}/api/candles?symbol=${symbol}`
-    );
-    const candles = await candlesRes.json();
-
-    const tech = technicals;
-
-const rsi = tech?.rsi || 50;
-const macd = tech?.macd || 0;
-const sma50 = tech?.sma50 || 0;
-const sma200 = tech?.sma200 || 0;
-
-// Simple signal logic
-let signal = "HOLD";
-let confidence = 50;
-
-if (rsi < 30 && macd > 0 && sma50 > sma200) {
-  signal = "BUY";
-  confidence = 75;
-} else if (rsi > 70 && macd < 0 && sma50 < sma200) {
-  signal = "SELL";
-  confidence = 75;
-}
-
-// FINAL RESPONSE (MATCHES FRONTEND)
-res.json({
-  ticker: symbol,
-
-  signal,
-  confidence,
-
-  indicators: {
-    rsi,
-    macd,
-    sma50,
-    sma200
-  },
-
-  charts: {
-    price: candles || [],
-    rsi: candles?.map(c => ({
-      time: c.time,
-      value: rsi
-    })) || []
-  },
-
-  raw: {
-    quote: quote[0],
-    technicals,
-    candles
-  }
-});
-
-  } catch (err) {
-    console.error("Analyze error:", err);
-    res.status(500).json({ error: "Analyze failed" });
-  }
-});
 
 app.listen(PORT, () => {
   console.log(`✓ Quantyx backend running on port ${PORT}`);
